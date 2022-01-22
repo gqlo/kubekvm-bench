@@ -1,0 +1,301 @@
+#!/bin/bash -e
+
+NAME="opensuse-4"           # name of the VM to use for testing
+RESDIR="/root/results"      # path to directory for test results
+XMLDIR="/root/testxml"      # path to directory for test XML
+XML=                        # holds current test XML
+VMIP=                       # the current VM's IP address
+STRESSER=                   # process ID of the host load stresser
+
+#============== initial checks =============================================
+
+# check that the named VM exists
+if ! virsh list --all | grep -qE "^ *\S+ +$NAME "; then
+    echo >&2 "VM $NAME doesn't exist"
+    exit 1
+fi
+
+# check that the named VM does not already have vCPU pinning
+if virsh vcpuinfo "$NAME" | grep -q '^CPU Affinity: *-'; then
+    echo >&2 "VM $NAME already has vCPU pinning"
+    exit 1
+fi
+
+# check that there are no running VMs
+if virsh list | grep -q 'running$'; then
+    echo >&2 "There are VMs running, please shut them down"
+    exit 1
+fi
+
+# ensure that the results and XML output dirs exist
+mkdir -p "$RESDIR"
+mkdir -p "$XMLDIR"
+
+exec 3>&1   # save stdout to spare file handle 3
+exec 4>&2   # save stderr to spare file handle 4
+
+# set CPU freq scaling governor to use the "performance" profile
+trap 'cpupower frequency-set -g powersave' EXIT
+cpupower frequency-set -g performance >/dev/null
+cpupower frequency-info -p
+
+#============== functions ==================================================
+
+# all the tests to run via ssh
+# arg is the cpu topology name (used as a filename suffix)
+runtests() {
+    echo "* runtests $*"
+    testheader "$1"
+
+    echo; echo "---------- cyclictest ----------"
+    sshrun cyclictest -a 0,1 -q -l 10000
+
+    testfooter
+}
+
+# run or stop load stresser in the background
+stress() {
+    echo "* stress $*"
+    return # FIXME
+    STRESSER="$(pgrep stress-ng | grep -x "$STRESSER")"
+    if [[ "$1" == "on" ]]; then
+        if [[ -n "$STRESSER" ]]; then
+            echo >&2 "Stress-ng is already running"
+            return
+        fi
+        if [[ "$(</sys/devices/system/cpu/smt/control)" == "on" ]]; then
+            stress-ng --cpu 20 --cpu-method fibonacci --cpu-load 50 &
+        else
+            stress-ng --cpu 10 --cpu-method fibonacci --cpu-load 50 &
+        fi
+        STRESSER="$!"
+        trap 'stress off; cpupower frequency-set -g powersave' EXIT
+    else
+        if [[ -n "$STRESSER" ]]; then
+            kill "$STRESSER" || true
+            sleep 10        # let the CPU cool off
+        else
+            echo >&2 "Stress-ng is not running"
+        fi
+        trap 'cpupower frequency-set -g powersave' EXIT
+    fi
+}
+
+# factor out the tedious repetition of ssh root@"$VMIP"
+sshrun() {
+    ssh root@"$VMIP" "$@"
+}
+
+# separate out the rather complex header code, and I/O redirection
+# arg is the logfile suffix
+testheader() {
+    echo "$XML" > "$XMLDIR/$NAME-$1.xml"
+    exec &>> "$RESDIR/$NAME-$1" # redirect all stdout and stderr to the results file
+    echo "==================== Starting $(date '+%F %T %Z') ===================="
+    # show the current hyperthread and pinning config
+    echo -n "Hyperthreading is $(</sys/devices/system/cpu/smt/control), with "
+    if virsh vcpuinfo "$NAME" | grep -q '^CPU Affinity: *-'; then
+        echo "this vCPU pinning:"
+        virsh vcpuinfo "$NAME" | sed '/State\|time/d;/./{H;d};x;s/CPU //;s/  \+/ /g;s/^\n//;s/\n/, /g'
+    else
+        echo "no pinning."
+    fi
+    # show what cores the guest can see, including whether it is hyperthread aware
+    sshrun 'grep -H ^ /sys/devices/system/cpu/cpu*/topology/thread_siblings_list \
+    | sed -r '\''s/^[^0-9]+([0-9]+)[^:]+:([^,-]*)[,-]?\<\1\>[,-]?([^,-]*)$/\1:\2\3/;s/:$//;
+    s/:(.+)/(sib=\1)/;H;$!d;g;s/\n/  /g;s/\)$/)  hyperthread aware/;s/^/Guest cores:/'\'
+}
+
+# separate out the footer and close I/O redirect
+testfooter() {
+    echo; echo "==================== Stopping $(date '+%F %T %Z') ===================="; echo
+    exec >&3 2>&4 # end the I/O redirection
+}
+
+# read the IP of the VM
+getip() {
+    echo "* getip"
+    local WAIT
+    let WAIT=EPOCHSECONDS+10
+    while true; do
+        VMIP="$(virsh domifaddr "$NAME" | sed -nr 's,.* (\S+)/.*,\1,p')"
+        if [[ -n "$VMIP" ]]; then
+            break
+        fi
+        if [[ "$EPOCHSECONDS" -gt "$WAIT" ]]; then
+            echo >&2 "VM $NAME failed to get VM IP"
+            exit 1
+        fi
+        sleep 1
+    done
+    echo "VMIP is $VMIP"
+}
+
+# enable or disable hyper threading
+# arg is "on" or "off" respectively
+# FIXME
+ht() {
+    echo "* ht $*"
+    #echo "$1" > /sys/devices/system/cpu/smt/control
+}
+
+# start the VM with the given vCPU pinning
+# with no args, it starts the VM without pinning
+# otherwise the args are the host CPU numbers to pin to, eg:
+# vmstart 1 17 2 18
+vmstart() {
+    echo "* vmstart $*"
+    local N=0 PIN="" MIN MAX TH=1
+    local CORES="$(virsh vcpucount "$NAME" | sed -n 's/^maximum *config *//p')"
+    IFS=- read MIN MAX < /sys/devices/system/cpu/online
+    while [[ $# -ne 0 ]]; do
+        if [[ "$1" == "ht" ]]; then
+            TH=2
+        else
+            if [[ "$N" -ge "$CORES" ]]; then
+                echo >&2 "Cannot pin more than $CORES cores in VM $NAME"
+                exit 1
+            fi
+            if [[ "$1" -lt "$MIN" || "$1" -gt "$MAX" ]]; then
+                echo >&2 "Cannot pin VM $NAME to core $1 when only cores $MIN..$MAX are available"
+                exit 1
+            fi
+            PIN="$PIN,vcpupin$N.vcpu=$N,vcpupin$N.cpuset=$1"
+            let N=N+1
+        fi
+        shift
+    done
+    let CORES/=TH
+    XML="$(virt-xml "$NAME" --edit --cputune=clearxml=yes"$PIN" --print-xml)"
+    XML="$(virt-xml <<<"$XML" --edit --cpu=clearxml=yes,mode=host-model,topology.sockets=1,topology.cores="$CORES",topology.threads="$TH" --print-xml)"
+    echo "Starting VM $NAME with cores=$CORES threads=$TH"
+    # <() syntax creates a tmp file that virsh can read
+    if ! virsh create <(echo "$XML"); then
+        echo >&2 "Failed to start $NAME"
+        exit 1
+    fi
+    sleep 2
+    getip       # also get the IP
+    waitssh     # also wait for ssh daemon
+}
+
+
+# wait for the VM to boot and ssh daemon to be ready
+waitssh() {
+    echo "* waitssh"
+    local WAIT
+    let WAIT=EPOCHSECONDS+40
+    while true; do
+        if nc -nzw2 "$VMIP" 22; then # test if port 22 is open
+            break
+        fi
+        if [[ "$EPOCHSECONDS" -gt "$WAIT" ]]; then
+            echo >&2 "VM $NAME failed to boot"
+            exit 1
+        fi
+        sleep 2
+    done
+}
+
+# tell the VM to shutdown
+vmstop() {
+    echo "* vmstop"
+    ssh root@"$VMIP" poweroff || true
+    waitstop    # also wait for it to shut down
+}
+
+# wait for the VM to shutdown
+waitstop() {
+    echo "* waitstop"
+    local WAIT
+    let WAIT=EPOCHSECONDS+20
+    while true; do
+        if virsh list --all | grep -qE "^ *\S+ +$NAME +shut off$"; then
+            break
+        fi
+        if [[ "$EPOCHSECONDS" -gt "$WAIT" ]]; then
+            echo >&2 "VM $NAME failed to shut down"
+            exit 1
+        fi
+        sleep 2
+    done
+}
+
+#============== Host ht-on, vm ht-off, unpinned, idle =======================
+
+ht on
+vmstart
+
+# check ssh connection before running any tests
+# so the user can enter YES at the prompt before continuing
+sshrun "date '+%F %T %Z'"
+
+runtests hton-htunaware-nopin-idle
+vmstop
+
+#============== Host ht-on, vm ht-off, unpinned, loaded =====================
+
+ht on
+stress on
+vmstart
+runtests hton-htunaware-nopin-stressed
+vmstop
+stress off
+
+#============== Host ht-on, vm ht-aware, pinned, idle =======================
+
+ht on
+vmstart 1 17 2 18 ht
+runtests hton-htaware-pin-idle
+vmstop
+
+#============== Host ht-on, vm ht-aware, pinned, loaded =====================
+
+ht on
+stress on
+vmstart 1 17 2 18 ht
+runtests hton-htaware-pin-stressed
+vmstop
+stress off
+
+#============== Host ht-off, vm ht-off, unpinned, idle ======================
+
+ht off
+vmstart
+runtests htoff-htunware-nopin-idle
+vmstop
+
+#============== Host ht-off, vm ht-off, unpinned, loaded ====================
+
+ht off
+stress on
+vmstart
+runtests htoff-htunware-nopin-stressed
+vmstop
+stress off
+
+#============== Host ht-off, vm ht-off, pinned, idle ========================
+
+ht off
+vmstart 0 2 4 6
+runtests htoff-htunaware-pin-idle
+vmstop
+
+#============== Host ht-off, vm ht-off, pinned, loaded ======================
+
+ht off
+stress on
+vmstart 0 2 4 6
+runtests htoff-htunaware-pin-stressed
+vmstop
+stress off
+
+#============== Final tidy up ===============================================
+
+ht on
+stress off
+echo; echo "All tests completed"
+cpupower frequency-set -g powersave >/dev/null
+cpupower frequency-info -p
+trap EXIT
+
