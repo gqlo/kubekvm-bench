@@ -9,6 +9,9 @@ STRESSER=                   # process ID of the host load stresser
 
 #============== initial checks =============================================
 
+# make sure we don't loop
+test -f /root/benchkvm-continue && rm /root/benchkvm-continue
+
 # check that the named VM exists
 if ! virsh list --all | grep -qE "^ *\S+ +$NAME "; then
     echo >&2 "VM $NAME doesn't exist"
@@ -48,7 +51,14 @@ runtests() {
     testheader "$1"
 
     echo; echo "---------- cyclictest ----------"
-    sshrun cyclictest -a 0,1 -q -l 10000
+    sshrun cyclictest -a 0,1 -q -l 1000
+
+    echo; echo "-------------- NPB --------------"
+    for NPB in bt.C.x cg.C.x ep.C.x ft.C.x is.C.x lu.C.x mg.C.x sp.C.x ua.C.x; do
+        echo; echo "--- NPB class $NPB start ---"
+        sshrun "$NPB"
+        echo; echo "--- NPB class $NPB end ---"
+    done
 
     testfooter
 }
@@ -131,14 +141,6 @@ getip() {
     echo "VMIP is $VMIP"
 }
 
-# enable or disable hyper threading
-# arg is "on" or "off" respectively
-# FIXME
-ht() {
-    echo "* ht $*"
-    #echo "$1" > /sys/devices/system/cpu/smt/control
-}
-
 # start the VM with the given vCPU pinning
 # with no args, it starts the VM without pinning
 # otherwise the args are the host CPU numbers to pin to, eg:
@@ -179,6 +181,15 @@ vmstart() {
     waitssh     # also wait for ssh daemon
 }
 
+vmstartxml() {
+    if ! virsh create "$1"; then
+        echo >&2 "Failed to start $1"
+        exit 1
+    fi
+    sleep 2
+    getip
+    waitshh
+}
 
 # wait for the VM to boot and ssh daemon to be ready
 waitssh() {
@@ -221,81 +232,82 @@ waitstop() {
     done
 }
 
-#============== Host ht-on, vm ht-off, unpinned, idle =======================
+if [[ "$(</sys/devices/system/cpu/smt/control)" == "on" ]]; then # ht on
 
-ht on
-vmstart
+    #============== Host ht-on, vm ht-unaware, unpinned, idle ===================
 
-# check ssh connection before running any tests
-# so the user can enter YES at the prompt before continuing
-sshrun "date '+%F %T %Z'"
+    vmstart
+    sshrun "date '+%F %T %Z'" # quick check ssh connection
+    runtests hton-htunaware-nopin-idle
+    vmstop
 
-runtests hton-htunaware-nopin-idle
-vmstop
+    #============== Host ht-on, vm ht-aware, pinned, idle =======================
 
-#============== Host ht-on, vm ht-off, unpinned, loaded =====================
+    vmstart 1 17 2 18 ht
+    runtests hton-htaware-pin-idle
+    vmstop
 
-ht on
-stress on
-vmstart
-runtests hton-htunaware-nopin-stressed
-vmstop
-stress off
+else # ht off
 
-#============== Host ht-on, vm ht-aware, pinned, idle =======================
+    #============== Host ht-off, vm ht-off, unpinned, idle ======================
 
-ht on
-vmstart 1 17 2 18 ht
-runtests hton-htaware-pin-idle
-vmstop
+    vmstart
+    runtests htoff-htunware-nopin-idle
+    vmstop
 
-#============== Host ht-on, vm ht-aware, pinned, loaded =====================
+    #============== Host ht-off, vm ht-off, pinned, idle ========================
 
-ht on
-stress on
-vmstart 1 17 2 18 ht
-runtests hton-htaware-pin-stressed
-vmstop
-stress off
+    vmstart 0 2 4 6
+    runtests htoff-htunaware-pin-idle
+    vmstop
 
-#============== Host ht-off, vm ht-off, unpinned, idle ======================
-
-ht off
-vmstart
-runtests htoff-htunware-nopin-idle
-vmstop
-
-#============== Host ht-off, vm ht-off, unpinned, loaded ====================
-
-ht off
-stress on
-vmstart
-runtests htoff-htunware-nopin-stressed
-vmstop
-stress off
-
-#============== Host ht-off, vm ht-off, pinned, idle ========================
-
-ht off
-vmstart 0 2 4 6
-runtests htoff-htunaware-pin-idle
-vmstop
-
-#============== Host ht-off, vm ht-off, pinned, loaded ======================
-
-ht off
-stress on
-vmstart 0 2 4 6
-runtests htoff-htunaware-pin-stressed
-vmstop
-stress off
+fi
 
 #============== Final tidy up ===============================================
 
-ht on
-stress off
-echo; echo "All tests completed"
+echo; echo "Tests completed for ht=$(</sys/devices/system/cpu/smt/control)"
 cpupower frequency-set -g powersave >/dev/null
 cpupower frequency-info -p
 trap EXIT
 
+if [[ "$1" == "reboot" ]]; then
+    if [[ "$(</sys/devices/system/cpu/smt/control)" == "on" ]]; then
+        touch /root/benchkvm-continue
+        grub-reboot nosmt
+    fi
+    reboot
+fi
+
+
+#    #============== Host ht-on, vm ht-off, unpinned, loaded =====================
+#
+#    stress on
+#    vmstart
+#    runtests hton-htunaware-nopin-stressed
+#    vmstop
+#    stress off
+#
+#    #============== Host ht-on, vm ht-aware, pinned, loaded =====================
+#
+#    stress on
+#    vmstart 1 17 2 18 ht
+#    runtests hton-htaware-pin-stressed
+#    vmstop
+#    stress off
+#
+#    #============== Host ht-off, vm ht-off, unpinned, loaded ====================
+#
+#    stress on
+#    vmstart
+#    runtests htoff-htunware-nopin-stressed
+#    vmstop
+#    stress off
+#
+#    #============== Host ht-off, vm ht-off, pinned, loaded ======================
+#
+#    stress on
+#    vmstart 0 2 4 6
+#    runtests htoff-htunaware-pin-stressed
+#    vmstop
+#    stress off
+#
