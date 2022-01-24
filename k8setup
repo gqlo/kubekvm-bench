@@ -1,0 +1,35 @@
+#!/bin/bash -e
+
+# Do this only once:
+# addgroup kube
+# adduser USER kube
+
+echo "Intializing k8s cluster....... it might take up to 4 mins"
+kubeadm init > kubeinit.log
+chgrp kube /etc/kubernetes/admin.conf
+chmod g+r  /etc/kubernetes/admin.conf
+KUBEJOIN="$(cat kubeinit.log | sed ':j;/\\$/{N;s/\\\n//;bj}' | grep '^kubeadm join ')"
+ssh root@rocks02 "$KUBEJOIN"
+
+( cd /home
+for USR in *; do
+    test -f /home/"$USR"/.profile || touch /home/"$USR"/.profile
+    grep -q 'export KUBECONFIG=/etc/kubernetes/admin.conf' /home/"$USR"/.profile \
+    || { echo; echo 'export KUBECONFIG=/etc/kubernetes/admin.conf'; } >> /home/"$USR"/.profile
+done )
+
+USR="guoqing"
+
+su - "$USR" <<END
+
+kubectl apply -f "https://cloud.weave.works/k8s/net?k8s-version=$(kubectl version | base64 | tr -d '\n')"
+kubectl wait --for=condition=Ready pods --all --all-namespaces
+kubectl create -f /home/guoqing/k8s/yaml/kubevirt-operator.yaml
+kubectl wait --for=condition=Ready pods --all --all-namespaces
+kubectl create -f /home/guoqing/k8s/yaml/kubevirt-cr.yaml
+kubectl wait --for=condition=Ready pods --all --all-namespaces
+kubectl apply -f /home/guoqing/k8s/yaml/suse_pv.yaml
+kubectl apply -f /home/guoqing/k8s/yaml/suse_pvc.yaml
+kubectl wait --for=condition=Ready pods --all --all-namespaces
+
+END
