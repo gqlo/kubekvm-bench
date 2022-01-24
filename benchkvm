@@ -51,7 +51,9 @@ runtests() {
     testheader "$1"
 
     echo; echo "---------- cyclictest ----------"
-    sshrun cyclictest -a 0,1 -q -l 1000
+    for i in {1..20}; do
+        sshrun cyclictest -a 0,1 -q -l 10000
+    done
 
     echo; echo "-------------- NPB --------------"
     for NPB in bt.C.x cg.C.x ep.C.x ft.C.x is.C.x lu.C.x mg.C.x sp.C.x ua.C.x; do
@@ -144,32 +146,31 @@ getip() {
 # start the VM with the given vCPU pinning
 # with no args, it starts the VM without pinning
 # otherwise the args are the host CPU numbers to pin to, eg:
-# vmstart 1 17 2 18
+# vmstart 1 17 2 18 ht
 vmstart() {
     echo "* vmstart $*"
-    local N=0 PIN="" MIN MAX TH=1
-    local CORES="$(virsh vcpucount "$NAME" | sed -n 's/^maximum *config *//p')"
+    local CORES=0 TH=1 MIN MAX PIN=""
     IFS=- read MIN MAX < /sys/devices/system/cpu/online
     while [[ $# -ne 0 ]]; do
         if [[ "$1" == "ht" ]]; then
             TH=2
         else
-            if [[ "$N" -ge "$CORES" ]]; then
-                echo >&2 "Cannot pin more than $CORES cores in VM $NAME"
-                exit 1
-            fi
             if [[ "$1" -lt "$MIN" || "$1" -gt "$MAX" ]]; then
                 echo >&2 "Cannot pin VM $NAME to core $1 when only cores $MIN..$MAX are available"
                 exit 1
             fi
-            PIN="$PIN,vcpupin$N.vcpu=$N,vcpupin$N.cpuset=$1"
-            let N=N+1
+            PIN="$PIN,vcpupin$CORES.vcpu=$CORES,vcpupin$CORES.cpuset=$1"
+            let CORES=CORES+1
         fi
         shift
     done
+    if [[ "$CORES" -eq 0 ]]; then
+        CORES="$(virsh vcpucount "$NAME" | sed -n 's/^maximum *config *//p')"
+    fi
+    XML="$(virt-xml "$NAME" --edit --vcpus=vcpu="$CORES" --print-xml)"
     let CORES/=TH
-    XML="$(virt-xml "$NAME" --edit --cputune=clearxml=yes"$PIN" --print-xml)"
     XML="$(virt-xml <<<"$XML" --edit --cpu=clearxml=yes,mode=host-model,topology.sockets=1,topology.cores="$CORES",topology.threads="$TH" --print-xml)"
+    XML="$(virt-xml <<<"$XML" --edit --cputune=clearxml=yes"$PIN" --print-xml)"
     echo "Starting VM $NAME with cores=$CORES threads=$TH"
     # <() syntax creates a tmp file that virsh can read
     if ! virsh create <(echo "$XML"); then
@@ -197,7 +198,7 @@ waitssh() {
     local WAIT
     let WAIT=EPOCHSECONDS+40
     while true; do
-        if nc -nzw2 "$VMIP" 22; then # test if port 22 is open
+        if nc -nzw2 "$VMIP" 22; then # test if port 22 is open:
             break
         fi
         if [[ "$EPOCHSECONDS" -gt "$WAIT" ]]; then
@@ -234,31 +235,59 @@ waitstop() {
 
 if [[ "$(</sys/devices/system/cpu/smt/control)" == "on" ]]; then # ht on
 
-    #============== Host ht-on, vm ht-unaware, unpinned, idle ===================
-
     vmstart
     sshrun "date '+%F %T %Z'" # quick check ssh connection
     runtests hton-htunaware-nopin-idle
     vmstop
 
-    #============== Host ht-on, vm ht-aware, pinned, idle =======================
+    vmstart 0 2 4 6
+    runtests hton-htunaware-pin-indep-idle
+    vmstop
+
+    vmstart 0 2 8 10
+    runtests hton-htunaware-pin-indep-numasplit-idle
+    vmstop
 
     vmstart 1 17 2 18 ht
-    runtests hton-htaware-pin-idle
+    runtests hton-htaware-pin-sib-idle
+    vmstop
+
+    vmstart 1 2 17 18 ht
+    runtests hton-htaware-pin-mistopo-idle
+    vmstop
+
+    vmstart 0 2
+    runtests hton-htunaware-pin-2indep-idle
+    vmstop
+
+    vmstart 1 17 ht
+    runtests hton-htaware-pin-2sib-idle
     vmstop
 
 else # ht off
-
-    #============== Host ht-off, vm ht-off, unpinned, idle ======================
 
     vmstart
     runtests htoff-htunware-nopin-idle
     vmstop
 
-    #============== Host ht-off, vm ht-off, pinned, idle ========================
-
     vmstart 0 2 4 6
-    runtests htoff-htunaware-pin-idle
+    runtests htoff-htunaware-pin-indep-idle
+    vmstop
+
+    vmstart 0 2 8 10
+    runtests htoff-htunaware-pin-indep-numasplit-idle
+    vmstop
+
+    vmstart 0 2 4 6 ht
+    runtests htoff-htaware-pin-fakesib-idle
+    vmstop
+
+    vmstart 0 2
+    runtests htoff-htunaware-pin-2indep-idle
+    vmstop
+
+    vmstart 0
+    runtests htoff-htunaware-pin-1core-idle
     vmstop
 
 fi
@@ -277,6 +306,41 @@ if [[ "$1" == "reboot" ]]; then
     fi
     reboot
 fi
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 #    #============== Host ht-on, vm ht-off, unpinned, loaded =====================
@@ -310,4 +374,3 @@ fi
 #    runtests htoff-htunaware-pin-stressed
 #    vmstop
 #    stress off
-#
