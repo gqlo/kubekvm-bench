@@ -1,54 +1,40 @@
 #!/bin/bash -e
 
-RESDIR="/root/results/kube"     # path to directory for test results
-XMLDIR="/root/testxml/kube"     # path to directory for test XML
+RESDIR="/root/results/kube"          # path to directory for test results
+XMLDIR="/root/testcfg/kubexml"       # path to directory for test XML
+YAMLDIR="/root/testcfg/kubeyaml"     # path to directory for test YAML
+BASEYAML="/root/yaml/kube-vmi.yaml"  # path to base YAML file
+WORKER="rocks02"                     # hostname of worker node
 
-POD=                            # name of launcher pod
-NAME=                           # name of the VM to use for testing
-XML=                            # holds current test XML
-VMIP=                           # the current VM's IP address
-STRESSER=                       # process ID of the host load stresser
+POD=                                 # name of launcher pod
+VMI=                                 # name of the vm instance
+IVM=                                 # name of the vm inside of the pod
+XML=                                 # holds current test XML
+YAML=                                # holds current test YAML
+VMIP=                                # the current VM's IP address
+STRESSER=                            # process ID of the host load stresser
 
 #============== initial checks =============================================
 
-# make sure we don't loop
-test -f /root/kubebench-continue && rm /root/kubebench-continue
-
-# get the launcher pod name
-POD="$(kubectl get pod | sed -nr 's/^(virt-launcher-\S*).*/\1/p')"
-
-# get the internal VM name
-NAME="$(kubectl exec "$POD" -- virsh list | sed -nr 's/^ *[0-9]+ *(\S+) *running$/\1/p')"
-
-# check that the named VM exists
-if ! kvrun virsh list --all | grep -qE "^ *\S+ +$NAME "; then
-    echo >&2 "VM $NAME doesn't exist"
-    exit 1
-fi
-
-# check that the named VM does not already have vCPU pinning
-if kvrun virsh vcpuinfo "$NAME" | grep -q '^CPU Affinity: *-'; then
-    echo >&2 "VM $NAME already has vCPU pinning"
+# check that the named YAML file exists
+if [[ ! -f "$BASEYAML" ]]; then
+    echo >&2 "File $BASEYAML doesn't exist"
     exit 1
 fi
 
 # check that there are no running VMs
-if kvrun virsh list | grep -q 'running$'; then
-    echo >&2 "There are VMs running, please shut them down"
+if kubectl get pods --all-namespaces | grep -qE '^\S+ *virt-launcher-'; then
+    echo >&2 "There are launcher pods running, please delete them"
     exit 1
 fi
 
 # ensure that the results and XML output dirs exist
 mkdir -p "$RESDIR"
 mkdir -p "$XMLDIR"
+mkdir -p "$YAMLDIR"
 
 exec 3>&1   # save stdout to spare file handle 3
 exec 4>&2   # save stderr to spare file handle 4
-
-# set CPU freq scaling governor to use the "performance" profile
-trap 'cpupower frequency-set -g powersave' EXIT
-cpupower frequency-set -g performance >/dev/null
-cpupower frequency-info -p
 
 #============== functions ==================================================
 
@@ -59,16 +45,16 @@ runtests() {
     testheader "$1"
 
     echo; echo "---------- cyclictest ----------"
-    for i in {1..20}; do
-        sshrun cyclictest -t 2 -q -l 10000
+    for i in {1..2}; do
+        sshrun cyclictest -t 2 -q -l 100
     done
 
-    echo; echo "-------------- NPB --------------"
-    for NPB in bt.C.x cg.C.x ep.C.x ft.C.x is.C.x lu.C.x mg.C.x sp.C.x ua.C.x; do
-        echo; echo "--- NPB class $NPB start ---"
-        sshrun "$NPB"
-        echo; echo "--- NPB class $NPB end ---"
-    done
+    #echo; echo "-------------- NPB --------------"
+    #for NPB in bt.C.x cg.C.x ep.C.x ft.C.x is.C.x lu.C.x mg.C.x sp.C.x ua.C.x; do
+    #    echo; echo "--- NPB class $NPB start ---"
+    #    sshrun "$NPB"
+    #    echo; echo "--- NPB class $NPB end ---"
+    #done
 
     testfooter
 }
@@ -101,6 +87,10 @@ stress() {
     fi
 }
 
+workerrun() {
+    ssh root@"$WORKER" "$@"
+}
+
 # factor out the tedious repetition of ssh root@"$VMIP"
 sshrun() {
     ssh root@"$VMIP" "$@"
@@ -113,14 +103,15 @@ kvrun() {
 # separate out the rather complex header code, and I/O redirection
 # arg is the logfile suffix
 testheader() {
-    echo "$XML" > "$XMLDIR/$NAME-$1.xml"
-    exec &>> "$RESDIR/$NAME-$1" # redirect all stdout and stderr to the results file
+    echo "$XML" > "$XMLDIR/$VMI-$1.xml"
+    echo "$YAML" > "$YAMLDIR/$VMI-$1.xml"
+    exec &>> "$RESDIR/$VMI-$1" # redirect all stdout and stderr to the results file
     echo "==================== Starting $(date '+%F %T %Z') ===================="
     # show the current hyperthread and pinning config
-    echo -n "Hyperthreading is $(</sys/devices/system/cpu/smt/control), with "
-    if kvrun virsh vcpuinfo "$NAME" | grep -q '^CPU Affinity: *-'; then
+    echo -n "Hyperthreading is $(workerrun cat /sys/devices/system/cpu/smt/control), with "
+    if kvrun virsh vcpuinfo "$IVM" | grep -q '^CPU Affinity: *-'; then
         echo "this vCPU pinning:"
-        kvrun virsh vcpuinfo "$NAME" | sed '/State\|time/d;/./{H;d};x;s/CPU //;s/  \+/ /g;s/^\n//;s/\n/, /g'
+        kvrun virsh vcpuinfo "$IVM" | sed '/State\|time/d;/./{H;d};x;s/CPU //;s/  \+/ /g;s/^\n//;s/\n/, /g'
     else
         echo "no pinning."
     fi
@@ -142,12 +133,12 @@ getip() {
     local WAIT
     let WAIT=EPOCHSECONDS+25
     while true; do
-        VMIP="$(kubectl get vmi | sed -nr 's/^kube-vmi *\S+ *Running *(\S+) *\S+ *True$/\1/p')"
+        VMIP="$(kubectl get vmi | sed -nr "s/^$VMI"' *\S+ *Running *(\S+) *\S+ *True$/\1/p')"
         if [[ -n "$VMIP" ]]; then
             break
         fi
         if [[ "$EPOCHSECONDS" -gt "$WAIT" ]]; then
-            echo >&2 "VM $NAME failed to get VM IP"
+            echo >&2 "Failed to get IP of VMI $VMI"
             exit 1
         fi
         sleep 1
@@ -155,53 +146,28 @@ getip() {
     echo "VMIP is $VMIP"
 }
 
-# start the VM with the given vCPU pinning
-# with no args, it starts the VM without pinning
-# otherwise the args are the host CPU numbers to pin to, eg:
-# vmstart 1 17 2 18 ht
-vmstart() {
-    echo "* vmstart $*"
-    local CORES=0 TH=1 MIN MAX PIN=""
-    IFS=- read MIN MAX < /sys/devices/system/cpu/online
-    while [[ $# -ne 0 ]]; do
-        if [[ "$1" == "ht" ]]; then
-            TH=2
-        else
-            if [[ "$1" -lt "$MIN" || "$1" -gt "$MAX" ]]; then
-                echo >&2 "Cannot pin VM $NAME to core $1 when only cores $MIN..$MAX are available"
-                exit 1
-            fi
-            PIN="$PIN,vcpupin$CORES.vcpu=$CORES,vcpupin$CORES.cpuset=$1"
-            let CORES=CORES+1
-        fi
-        shift
-    done
-    if [[ "$CORES" -eq 0 ]]; then
-        CORES="$(virsh vcpucount "$NAME" | sed -n 's/^maximum *config *//p')"
-    fi
-    XML="$(virt-xml "$NAME" --edit --vcpus=vcpu="$CORES" --print-xml)"
-    let CORES/=TH
-    XML="$(virt-xml <<<"$XML" --edit --cpu=clearxml=yes,mode=host-passthrough,topology.sockets=1,topology.cores="$CORES",topology.threads="$TH" --print-xml)"
-    XML="$(virt-xml <<<"$XML" --edit --cputune=clearxml=yes"$PIN" --print-xml)"
-    echo "Starting VM $NAME with cores=$CORES threads=$TH"
-    # <() syntax creates a tmp file that virsh can read
-    if ! virsh create <(echo "$XML"); then
-        echo >&2 "Failed to start $NAME"
+kvstart() {
+    local CORES="$1" THREADS="${2:-1}" DCP
+    if [[ "$DCP" == "pin" ]]; then DCP="true"; else DCP="false"; fi
+    VMI="$(sed -nr '/name:/{s/^.*name: *(\S+).*/\1/p;q}' "$BASEYAML")"
+    YAML="$(sed -r "s/ cores:.*/ cores: $CORES/" "$BASEYAML")"
+    YAML="$(sed -r "s/ threads:.*/ threads: $THREADS/" <<<"$YAML")"
+    YAML="$(sed -r "s/ dedicatedCpuPlacement:.*/ dedicatedCpuPlacement: $DCP/" <<<"$YAML")"
+    if ! kubectl apply -f <(echo "$YAML"); then
+        echo >&2 "Failed to start $VMI"
         exit 1
     fi
-    sleep 2
+    kubectl wait --for=condition=Ready pods --all -n default
+    # get the launcher pod name
+    POD="$(kubectl get pod | sed -nr 's/^(virt-launcher-\S*).*/\1/p')"
+    echo "POD=$POD"
     getip       # also get the IP
-    waitssh     # also wait for ssh daemon
-}
-
-createvmi() {
-    if ! kubectl apply -f "$1"; then
-        echo >&2 "Failed to start $1"
-        exit 1
-    fi
+    # get the internal VM name
+    IVM="$(kvrun virsh list | sed -nr 's/^ *[0-9]+ *(\S+) *running$/\1/p')"
+    echo "IVM=$IVM"
+    XML="$(kvrun virsh dumpxml "$IVM")"
     sleep 2
-    getip
-    waitshh
+    waitssh     # also wait for ssh daemon
 }
 
 # wait for the VM to boot and ssh daemon to be ready
@@ -210,11 +176,11 @@ waitssh() {
     local WAIT
     let WAIT=EPOCHSECONDS+40
     while true; do
-        if nc -nzw2 "$VMIP" 22; then # test if port 22 is open:
+        if nc -nzw2 "$VMIP" 22; then # test if port 22 is open
             break
         fi
         if [[ "$EPOCHSECONDS" -gt "$WAIT" ]]; then
-            echo >&2 "VM $NAME failed to boot"
+            echo >&2 "VMI $VMI failed to boot"
             exit 1
         fi
         sleep 2
@@ -222,11 +188,10 @@ waitssh() {
 }
 
 # tell the VM to shutdown
-vmstop() {
-    echo "* vmstop"
-    ssh root@"$VMIP" poweroff || true
+kvstop() {
+    echo "* kvstop"
+    kubectl delete vmis "$VMI"
     waitstop    # also wait for it to shut down
-    kubectl delete vmis 
 }
 
 # wait for the VM to shutdown
@@ -235,155 +200,123 @@ waitstop() {
     local WAIT
     let WAIT=EPOCHSECONDS+20
     while true; do
-        if kvrun virsh list --all | grep -qE "^ *\S+ +$NAME +shut off$"; then
+        # |& combines both stdout and stderr into the pipe
+        if ! kubectl get vmi |& grep -qE "^$VMI "; then
             break
         fi
         if [[ "$EPOCHSECONDS" -gt "$WAIT" ]]; then
-            echo >&2 "VM $NAME failed to shut down"
+            echo >&2 "VMI $VMI failed to shut down"
             exit 1
         fi
         sleep 2
     done
 }
 
-if [[ "$(</sys/devices/system/cpu/smt/control)" == "on" ]]; then # ht on
+#============== main code ==================================================
 
-    vmstart
-    sshrun "date '+%F %T %Z'" # quick check ssh connection
-    runtests hton-htunaware-nopin-idle
-    vmstop
+while true; do
 
-    vmstart 0 2 4 6
-    runtests hton-htunaware-pin-indep-idle
-    vmstop
+    # set CPU freq scaling governor to use the "performance" profile
+    trap 'workerrun cpupower frequency-set -g powersave' EXIT
+    workerrun cpupower frequency-set -g performance >/dev/null
+    workerrun cpupower frequency-info -p
 
-    vmstart 0 2 8 10
-    runtests hton-htunaware-pin-indep-numasplit-idle
-    vmstop
+    if [[ "$(workerrun cat /sys/devices/system/cpu/smt/control)" == "on" ]]; then # ht on
 
-    vmstart 1 17 2 18 ht
-    runtests hton-htaware-pin-sib-idle
-    vmstop
+        kvstart 4 1
+        sshrun "date '+%F %T %Z'" # quick check ssh connection
+        runtests hton-htunaware-nopin-4x1-idle
+        kvstop
 
-    vmstart 1 2 17 18 ht
-    runtests hton-htaware-pin-mistopo-idle
-    vmstop
+        kvstart 4 1 pin
+        runtests hton-htunaware-pin-4x1-idle
+        kvstop
 
-    vmstart 0 2
-    runtests hton-htunaware-pin-2indep-idle
-    vmstop
+        kvstart 2 2
+        runtests hton-htaware-nopin-2x2-idle
+        kvstop
 
-    vmstart 1 17 ht
-    runtests hton-htaware-pin-2sib-idle
-    vmstop
+        kvstart 2 2 pin
+        runtests hton-htaware-pin-2x2-idle
+        kvstop
 
-else # ht off
+        kvstart 2 1 pin
+        runtests hton-htunaware-pin-2x1-idle
+        kvstop
 
-    vmstart
-    runtests htoff-htunware-nopin-idle
-    vmstop
+        kvstart 2 1
+        runtests hton-htunaware-nopin-2x1-idle
+        kvstop
 
-    vmstart 0 2 4 6
-    runtests htoff-htunaware-pin-indep-idle
-    vmstop
+        kvstart 1 2 pin
+        runtests hton-htaware-pin-1x2-idle
+        kvstop
 
-    vmstart 0 2 8 10
-    runtests htoff-htunaware-pin-indep-numasplit-idle
-    vmstop
+        kvstart 1 2
+        runtests hton-htaware-nopin-1x2-idle
+        kvstop
 
-    vmstart 0 2 4 6 ht
-    runtests htoff-htaware-pin-fakesib-idle
-    vmstop
+    else : # ht off
 
-    vmstart 0 2
-    runtests htoff-htunaware-pin-2indep-idle
-    vmstop
+        kvstart 4 1
+        runtests htoff-htunware-nopin-4x1-idle
+        kvstop
 
-    vmstart 0
-    runtests htoff-htunaware-pin-1core-idle
-    vmstop
+        kvstart 4 1 pin
+        runtests htoff-htunaware-pin-4x1-idle
+        kvstop
 
-fi
+        kvstart 2 1 pin
+        runtests htoff-htunaware-pin-2x1-idle
+        kvstop
 
-#============== Final tidy up ===============================================
+        kvstart 2 1
+        runtests htoff-htunaware-nopin-2x1-idle
+        kvstop
 
-echo; echo "Tests completed for ht=$(</sys/devices/system/cpu/smt/control)"
-cpupower frequency-set -g powersave >/dev/null
-cpupower frequency-info -p
-trap EXIT
+        kvstart 1 1 pin
+        runtests htoff-htunaware-pin-1x1-idle
+        kvstop
 
-if [[ "$1" == "reboot" ]]; then
-    if [[ "$(</sys/devices/system/cpu/smt/control)" == "on" ]]; then
-        touch /root/benchkvm-continue
-        grub-reboot nosmt
+        kvstart 1 1
+        runtests htoff-htunaware-nopin-1x1-idle
+        kvstop
+
     fi
-    reboot
-fi
 
+    #============== Final tidy up ===============================================
 
+    echo; echo "Tests completed for ht=$(workerrun cat /sys/devices/system/cpu/smt/control)"
+    workerrun cpupower frequency-set -g powersave >/dev/null
+    workerrun cpupower frequency-info -p
+    trap EXIT
 
+    if [[ "$1" == "reboot" ]]; then
+        if [[ "$(workerrun cat /sys/devices/system/cpu/smt/control)" == "on" ]]; then
+            echo "Rebooting worker node $WORKER into nosmt mode"
+            workerrun grub-reboot nosmt
+            workerrun reboot || true
+            let WAIT=EPOCHSECONDS+240
+            while true; do
+                # test if port 22 is open
+                if nc -nzw2 "$WORKER" 22 2>/dev/null; then
+                    break
+                fi
+                if [[ "$EPOCHSECONDS" -gt "$WAIT" ]]; then
+                    echo >&2 "Worker node $WORKER failed to reboot"
+                    exit 1
+                fi
+                echo "Waiting for reboot $((WAIT-EPOCHSECONDS))"
+                sleep 2
+            done
+        else
+            echo "Rebooting worker node $WORKER into normal smt mode"
+            workerrun reboot || true
+            break
+        fi
+    else
+        echo "Single pass done"
+        break
+    fi
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-#    #============== Host ht-on, vm ht-off, unpinned, loaded =====================
-#
-#    stress on
-#    vmstart
-#    runtests hton-htunaware-nopin-stressed
-#    vmstop
-#    stress off
-#
-#    #============== Host ht-on, vm ht-aware, pinned, loaded =====================
-#
-#    stress on
-#    vmstart 1 17 2 18 ht
-#    runtests hton-htaware-pin-stressed
-#    vmstop
-#    stress off
-#
-#    #============== Host ht-off, vm ht-off, unpinned, loaded ====================
-#
-#    stress on
-#    vmstart
-#    runtests htoff-htunware-nopin-stressed
-#    vmstop
-#    stress off
-#
-#    #============== Host ht-off, vm ht-off, pinned, loaded ======================
-#
-#    stress on
-#    vmstart 0 2 4 6
-#    runtests htoff-htunaware-pin-stressed
-#    vmstop
-#    stress off
+done
