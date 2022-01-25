@@ -1,11 +1,11 @@
 #!/bin/bash -e
 
-NAME="opensuse-4"           # name of the VM to use for testing
-RESDIR="/root/results"      # path to directory for test results
-XMLDIR="/root/testxml"      # path to directory for test XML
-XML=                        # holds current test XML
-VMIP=                       # the current VM's IP address
-STRESSER=                   # process ID of the host load stresser
+NAME="opensuse-4"              # name of the VM to use for testing
+RESDIR="/root/results/kvm"     # path to directory for test results
+XMLDIR="/root/testcfg/kvmxml"  # path to directory for test XML
+XML=                           # holds current test XML
+VMIP=                          # the current VM's IP address
+STRESSER=                      # process ID of the host load stresser
 
 #============== initial checks =============================================
 
@@ -52,7 +52,7 @@ runtests() {
 
     echo; echo "---------- cyclictest ----------"
     for i in {1..20}; do
-        sshrun cyclictest -a 0,1 -q -l 10000
+        sshrun cyclictest -t 2 -q -l 100000
     done
 
     echo; echo "-------------- NPB --------------"
@@ -169,7 +169,7 @@ vmstart() {
     fi
     XML="$(virt-xml "$NAME" --edit --vcpus=vcpu="$CORES" --print-xml)"
     let CORES/=TH
-    XML="$(virt-xml <<<"$XML" --edit --cpu=clearxml=yes,mode=host-model,topology.sockets=1,topology.cores="$CORES",topology.threads="$TH" --print-xml)"
+    XML="$(virt-xml <<<"$XML" --edit --cpu=clearxml=yes,mode=host-passthrough,topology.sockets=1,topology.cores="$CORES",topology.threads="$TH" --print-xml)"
     XML="$(virt-xml <<<"$XML" --edit --cputune=clearxml=yes"$PIN" --print-xml)"
     echo "Starting VM $NAME with cores=$CORES threads=$TH"
     # <() syntax creates a tmp file that virsh can read
@@ -180,16 +180,6 @@ vmstart() {
     sleep 2
     getip       # also get the IP
     waitssh     # also wait for ssh daemon
-}
-
-vmstartxml() {
-    if ! virsh create "$1"; then
-        echo >&2 "Failed to start $1"
-        exit 1
-    fi
-    sleep 2
-    getip
-    waitshh
 }
 
 # wait for the VM to boot and ssh daemon to be ready
@@ -233,65 +223,69 @@ waitstop() {
     done
 }
 
-if [[ "$(</sys/devices/system/cpu/smt/control)" == "on" ]]; then # ht on
-
-    vmstart
-    sshrun "date '+%F %T %Z'" # quick check ssh connection
-    runtests hton-htunaware-nopin-idle
-    vmstop
-
-    vmstart 0 2 4 6
-    runtests hton-htunaware-pin-indep-idle
-    vmstop
-
-    vmstart 0 2 8 10
-    runtests hton-htunaware-pin-indep-numasplit-idle
-    vmstop
-
-    vmstart 1 17 2 18 ht
-    runtests hton-htaware-pin-sib-idle
-    vmstop
-
-    vmstart 1 2 17 18 ht
-    runtests hton-htaware-pin-mistopo-idle
-    vmstop
-
-    vmstart 0 2
-    runtests hton-htunaware-pin-2indep-idle
-    vmstop
-
-    vmstart 1 17 ht
-    runtests hton-htaware-pin-2sib-idle
-    vmstop
-
-else # ht off
-
-    vmstart
-    runtests htoff-htunware-nopin-idle
-    vmstop
-
-    vmstart 0 2 4 6
-    runtests htoff-htunaware-pin-indep-idle
-    vmstop
-
-    vmstart 0 2 8 10
-    runtests htoff-htunaware-pin-indep-numasplit-idle
-    vmstop
-
-    vmstart 0 2 4 6 ht
-    runtests htoff-htaware-pin-fakesib-idle
-    vmstop
-
-    vmstart 0 2
-    runtests htoff-htunaware-pin-2indep-idle
-    vmstop
-
     vmstart 0
     runtests htoff-htunaware-pin-1core-idle
     vmstop
 
-fi
-
+#if [[ "$(</sys/devices/system/cpu/smt/control)" == "on" ]]; then # ht on
+#
+#    vmstart
+#    sshrun "date '+%F %T %Z'" # quick check ssh connection
+#    runtests hton-htunaware-nopin-idle
+#    vmstop
+#
+#    vmstart 0 2 4 6
+#    runtests hton-htunaware-pin-indep-idle
+#    vmstop
+#
+#    vmstart 0 2 8 10
+#    runtests hton-htunaware-pin-indep-numasplit-idle
+#    vmstop
+#
+#    vmstart 1 17 2 18 ht
+#    runtests hton-htaware-pin-sib-idle
+#    vmstop
+#
+#    vmstart 1 2 17 18 ht
+#    runtests hton-htaware-pin-mistopo-idle
+#    vmstop
+#
+#    vmstart 0 2
+#    runtests hton-htunaware-pin-2indep-idle
+#    vmstop
+#
+#    vmstart 1 17 ht
+#    runtests hton-htaware-pin-2sib-idle
+#    vmstop
+#
+#else # ht off
+#
+#    vmstart
+#    runtests htoff-htunware-nopin-idle
+#    vmstop
+#
+#    vmstart 0 2 4 6
+#    runtests htoff-htunaware-pin-indep-idle
+#    vmstop
+#
+#    vmstart 0 2 8 10
+#    runtests htoff-htunaware-pin-indep-numasplit-idle
+#    vmstop
+#
+#    vmstart 0 2 4 6 ht
+#    runtests htoff-htaware-pin-fakesib-idle
+#    vmstop
+#
+#    vmstart 0 2
+#    runtests htoff-htunaware-pin-2indep-idle
+#    vmstop
+#
+#    vmstart 0
+#    runtests htoff-htunaware-pin-1core-idle
+#    vmstop
+#
+#fi
+#
 #============== Final tidy up ===============================================
 
 echo; echo "Tests completed for ht=$(</sys/devices/system/cpu/smt/control)"
@@ -306,71 +300,3 @@ if [[ "$1" == "reboot" ]]; then
     fi
     reboot
 fi
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-#    #============== Host ht-on, vm ht-off, unpinned, loaded =====================
-#
-#    stress on
-#    vmstart
-#    runtests hton-htunaware-nopin-stressed
-#    vmstop
-#    stress off
-#
-#    #============== Host ht-on, vm ht-aware, pinned, loaded =====================
-#
-#    stress on
-#    vmstart 1 17 2 18 ht
-#    runtests hton-htaware-pin-stressed
-#    vmstop
-#    stress off
-#
-#    #============== Host ht-off, vm ht-off, unpinned, loaded ====================
-#
-#    stress on
-#    vmstart
-#    runtests htoff-htunware-nopin-stressed
-#    vmstop
-#    stress off
-#
-#    #============== Host ht-off, vm ht-off, pinned, loaded ======================
-#
-#    stress on
-#    vmstart 0 2 4 6
-#    runtests htoff-htunaware-pin-stressed
-#    vmstop
-#    stress off
