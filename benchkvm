@@ -1,11 +1,12 @@
 #!/bin/bash -e
 
-NAME="opensuse-4"              # name of the VM to use for testing
-RESDIR="/root/results/kvm"     # path to directory for test results
-XMLDIR="/root/testcfg/kvmxml"  # path to directory for test XML
-XML=                           # holds current test XML
-VMIP=                          # the current VM's IP address
-STRESSER=                      # process ID of the host load stresser
+NAME="opensuse-4"                  # name of the VM to use for testing
+RESDIR="/root/results/kvm"         # path to directory for test results
+XMLDIR="/root/testcfg/kvmxml"      # path to directory for test XML
+FLAGDIR="/root/testcfg/kvmflag"    # path to directory for guest vCPU flags
+XML=                               # holds current test XML
+VMIP=                              # the current VM's IP address
+STRESSER=                          # process ID of the host load stresser
 
 #============== initial checks =============================================
 
@@ -33,9 +34,12 @@ fi
 # ensure that the results and XML output dirs exist
 mkdir -p "$RESDIR"
 mkdir -p "$XMLDIR"
+mkdir -p "$FLAGDIR"
 
 exec 3>&1   # save stdout to spare file handle 3
 exec 4>&2   # save stderr to spare file handle 4
+
+lscpu | sed -nr '/^Flags: /{s/^Flags: *//;s/ +/\n/g;p}' | sort > "$FLAGDIR/HOST.txt"
 
 # set CPU freq scaling governor to use the "performance" profile
 trap 'cpupower frequency-set -g powersave' EXIT
@@ -101,8 +105,9 @@ sshrun() {
 # separate out the rather complex header code, and I/O redirection
 # arg is the logfile suffix
 testheader() {
+    local FLAGS
     echo "$XML" > "$XMLDIR/$NAME-$1.xml"
-    exec &>> "$RESDIR/$NAME-$1" # redirect all stdout and stderr to the results file
+    exec &>> "$RESDIR/$NAME-$1.txt" # redirect all stdout and stderr to the results file
     echo "==================== Starting $(date '+%F %T %Z') ===================="
     # show the current hyperthread and pinning config
     echo -n "Hyperthreading is $(</sys/devices/system/cpu/smt/control), with "
@@ -116,6 +121,12 @@ testheader() {
     sshrun 'grep -H ^ /sys/devices/system/cpu/cpu*/topology/thread_siblings_list \
     | sed -r '\''s/^[^0-9]+([0-9]+)[^:]+:([^,-]*)[,-]?\<\1\>[,-]?([^,-]*)$/\1:\2\3/;s/:$//;
     s/:(.+)/(sib=\1)/;H;$!d;g;s/\n/  /g;s/\)$/)  hyperthread aware/;s/^/Guest cores:/'\'
+
+    FLAGS="$(sshrun lscpu | sed -nr '/^Flags: /{s/^Flags: *//;s/ +/\n/g;p}' | sort)"
+    echo "Extra guest vCPU flags not on host:" > "$FLAGDIR/$VMI-$1.txt"
+    comm -13 "$FLAGDIR/HOST.txt" <(echo "$FLAGS") >> "$FLAGDIR/$VMI-$1.txt"
+    echo -e '\nHost CPU flags missing in guest:' >> "$FLAGDIR/$VMI-$1.txt"
+    comm -23 "$FLAGDIR/HOST.txt" <(echo "$FLAGS") >> "$FLAGDIR/$VMI-$1.txt"
 }
 
 # separate out the footer and close I/O redirect
