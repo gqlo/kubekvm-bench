@@ -3,6 +3,7 @@
 RESDIR="/root/results/kube"          # path to directory for test results
 XMLDIR="/root/testcfg/kubexml"       # path to directory for test XML
 YAMLDIR="/root/testcfg/kubeyaml"     # path to directory for test YAML
+FLAGDIR="/root/testcfg/kubeflag"     # path to directory for guest vCPU flags
 BASEYAML="/root/yaml/kube-vmi.yaml"  # path to base YAML file
 WORKER="rocks02"                     # hostname of worker node
 
@@ -32,9 +33,12 @@ fi
 mkdir -p "$RESDIR"
 mkdir -p "$XMLDIR"
 mkdir -p "$YAMLDIR"
+mkdir -p "$FLAGDIR"
 
 exec 3>&1   # save stdout to spare file handle 3
 exec 4>&2   # save stderr to spare file handle 4
+
+lscpu | sed -nr '/^Flags: /{s/^Flags: *//;s/ +/\n/g;p}' | sort > "$FLAGDIR/HOST.txt"
 
 #============== functions ==================================================
 
@@ -45,16 +49,16 @@ runtests() {
     testheader "$1"
 
     echo; echo "---------- cyclictest ----------"
-    for i in {1..2}; do
-        sshrun cyclictest -t 2 -q -l 100
+    for i in {1..20}; do
+        sshrun cyclictest -t 2 -q -l 100000
     done
 
-    #echo; echo "-------------- NPB --------------"
-    #for NPB in bt.C.x cg.C.x ep.C.x ft.C.x is.C.x lu.C.x mg.C.x sp.C.x ua.C.x; do
-    #    echo; echo "--- NPB class $NPB start ---"
-    #    sshrun "$NPB"
-    #    echo; echo "--- NPB class $NPB end ---"
-    #done
+    echo; echo "-------------- NPB --------------"
+    for NPB in bt.C.x cg.C.x ep.C.x ft.C.x is.C.x lu.C.x mg.C.x sp.C.x ua.C.x; do
+        echo; echo "--- NPB class $NPB start ---"
+        sshrun "$NPB"
+        echo; echo "--- NPB class $NPB end ---"
+    done
 
     testfooter
 }
@@ -93,7 +97,7 @@ workerrun() {
 
 # factor out the tedious repetition of ssh root@"$VMIP"
 sshrun() {
-    ssh root@"$VMIP" "$@"
+    ssh -o CheckHostIP=no root@"$VMIP" "$@"
 }
 
 kvrun() {
@@ -103,9 +107,10 @@ kvrun() {
 # separate out the rather complex header code, and I/O redirection
 # arg is the logfile suffix
 testheader() {
+    local FLAGS
     echo "$XML" > "$XMLDIR/$VMI-$1.xml"
-    echo "$YAML" > "$YAMLDIR/$VMI-$1.xml"
-    exec &>> "$RESDIR/$VMI-$1" # redirect all stdout and stderr to the results file
+    echo "$YAML" > "$YAMLDIR/$VMI-$1.yaml"
+    exec &>> "$RESDIR/$VMI-$1.txt" # redirect all stdout and stderr to the results file
     echo "==================== Starting $(date '+%F %T %Z') ===================="
     # show the current hyperthread and pinning config
     echo -n "Hyperthreading is $(workerrun cat /sys/devices/system/cpu/smt/control), with "
@@ -119,6 +124,12 @@ testheader() {
     sshrun 'grep -H ^ /sys/devices/system/cpu/cpu*/topology/thread_siblings_list \
     | sed -r '\''s/^[^0-9]+([0-9]+)[^:]+:([^,-]*)[,-]?\<\1\>[,-]?([^,-]*)$/\1:\2\3/;s/:$//;
     s/:(.+)/(sib=\1)/;H;$!d;g;s/\n/  /g;s/\)$/)  hyperthread aware/;s/^/Guest cores:/'\'
+
+    FLAGS="$(sshrun lscpu | sed -nr '/^Flags: /{s/^Flags: *//;s/ +/\n/g;p}' | sort)"
+    echo "Extra guest vCPU flags not on host:" > "$FLAGDIR/$VMI-$1.txt"
+    comm -13 "$FLAGDIR/HOST.txt" <(echo "$FLAGS") >> "$FLAGDIR/$VMI-$1.txt"
+    echo -e '\nHost CPU flags missing in guest:' >> "$FLAGDIR/$VMI-$1.txt"
+    comm -23 "$FLAGDIR/HOST.txt" <(echo "$FLAGS") >> "$FLAGDIR/$VMI-$1.txt"
 }
 
 # separate out the footer and close I/O redirect
@@ -147,7 +158,7 @@ getip() {
 }
 
 kvstart() {
-    local CORES="$1" THREADS="${2:-1}" DCP
+    local CORES="$1" THREADS="${2:-1}" DCP="$3"
     if [[ "$DCP" == "pin" ]]; then DCP="true"; else DCP="false"; fi
     VMI="$(sed -nr '/name:/{s/^.*name: *(\S+).*/\1/p;q}' "$BASEYAML")"
     YAML="$(sed -r "s/ cores:.*/ cores: $CORES/" "$BASEYAML")"
@@ -209,6 +220,49 @@ waitstop() {
             exit 1
         fi
         sleep 2
+    done
+}
+
+waitworkerup() {
+    let WAIT=EPOCHSECONDS+"$1"
+    while true; do
+        # test if port 22 is open
+        if nc -nzw2 "$(getent ahostsv4 "$WORKER" \
+            | sed -nr 's/^(\S+) *STREAM.*/\1/p')" 22; then
+            echo "Worker node $WORKER up"
+            if kubectl wait --for=condition=Ready nodes \
+                --timeout="$2"s --all --all-namespaces \
+                && kubectl wait --for=condition=Ready pods \
+                --timeout="$2"s --all --all-namespaces
+            then
+                echo "Worker node $WORKER ready"
+                break
+            else
+                echo "Worker node $WORKER up but kubelet service not responding"
+                exit 1
+            fi
+        fi
+        if [[ "$EPOCHSECONDS" -gt "$WAIT" ]]; then
+            echo >&2 "Worker node $WORKER failed to reboot back up"
+            exit 1
+        fi
+        echo "Waiting for worker to reboot back up $((WAIT-EPOCHSECONDS))"
+        sleep 2
+    done
+}
+
+waitworkerdown() {
+    let WAIT=EPOCHSECONDS+"$1"
+    while true; do
+        if ! ping -l 3 -c 3 -w 5 -q "$WORKER" &> /dev/null; then
+            echo "Worker node $WORKER down for reboot"
+            break
+        fi
+        if [[ "$EPOCHSECONDS" -gt "$WAIT" ]]; then
+            echo >&2 "Worker node $WORKER failed to go down for reboot"
+            exit 1
+        fi
+        echo "Waiting for worker to go down for reboot $((WAIT-EPOCHSECONDS))"
     done
 }
 
@@ -296,22 +350,13 @@ while true; do
             echo "Rebooting worker node $WORKER into nosmt mode"
             workerrun grub-reboot nosmt
             workerrun reboot || true
-            let WAIT=EPOCHSECONDS+240
-            while true; do
-                # test if port 22 is open
-                if nc -nzw2 "$WORKER" 22 2>/dev/null; then
-                    break
-                fi
-                if [[ "$EPOCHSECONDS" -gt "$WAIT" ]]; then
-                    echo >&2 "Worker node $WORKER failed to reboot"
-                    exit 1
-                fi
-                echo "Waiting for reboot $((WAIT-EPOCHSECONDS))"
-                sleep 2
-            done
+            waitworkerdown 20
+            waitworkerup 240 60      # boot timeout, kubelet timeout
         else
             echo "Rebooting worker node $WORKER into normal smt mode"
             workerrun reboot || true
+            waitworkerdown 20
+            waitworkerup 240 60      # boot timeout, kubelet timeout
             break
         fi
     else
