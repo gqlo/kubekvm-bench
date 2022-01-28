@@ -3,6 +3,7 @@
 NAME="opensuse-4"                  # name of the VM to use for testing
 RESDIR="/root/results/kvm"         # path to directory for test results
 XMLDIR="/root/testcfg/kvmxml"      # path to directory for test XML
+JSONDIR="/root/results/kvmjson"    # dir for cyclictest json data
 FLAGDIR="/root/testcfg/kvmflag"    # path to directory for guest vCPU flags
 XML=                               # holds current test XML
 VMIP=                              # the current VM's IP address
@@ -34,6 +35,7 @@ fi
 # ensure that the results and XML output dirs exist
 mkdir -p "$RESDIR"
 mkdir -p "$XMLDIR"
+mkdir -p "$JSONDIR"
 mkdir -p "$FLAGDIR"
 
 exec 3>&1   # save stdout to spare file handle 3
@@ -55,14 +57,17 @@ runtests() {
     testheader "$1"
 
     echo; echo "---------- cyclictest ----------"
-    for i in {1..20}; do
-        sshrun cyclictest -t 2 -q -l 100000
-    done
+    sshrun cyclictest -t 2 -v -l 100000 | sed '/^\S/d' | sort -sn | \
+    sed -nr ':a;s/^ +0: +\S+ +//;tb;bc;
+        :b;1s/^/{"T0":[/;s/$/,/;H;n;ba;
+        :c;x;s/,$/],/;s/\n//g;p;s/.*/"T1":[/;x;
+        :d;s/^ +1: +\S+ +//;s/$/,/;H;$!{n;bd};x;s/,$/]}/;s/\n//g;p' \
+        > "$JSONDIR/$NAME-$1.json"
 
     echo; echo "-------------- NPB --------------"
     for NPB in bt.C.x cg.C.x ep.C.x ft.C.x is.C.x lu.C.x mg.C.x sp.C.x ua.C.x; do
         echo; echo "--- NPB class $NPB start ---"
-        sshrun "$NPB"
+        sshrun "OMP_NUM_THREADS=2 $NPB"
         echo; echo "--- NPB class $NPB end ---"
     done
 
@@ -123,10 +128,10 @@ testheader() {
     s/:(.+)/(sib=\1)/;H;$!d;g;s/\n/  /g;s/\)$/)  hyperthread aware/;s/^/Guest cores:/'\'
 
     FLAGS="$(sshrun lscpu | sed -nr '/^Flags: /{s/^Flags: *//;s/ +/\n/g;p}' | sort)"
-    echo "Extra guest vCPU flags not on host:" > "$FLAGDIR/$VMI-$1.txt"
-    comm -13 "$FLAGDIR/HOST.txt" <(echo "$FLAGS") >> "$FLAGDIR/$VMI-$1.txt"
-    echo -e '\nHost CPU flags missing in guest:' >> "$FLAGDIR/$VMI-$1.txt"
-    comm -23 "$FLAGDIR/HOST.txt" <(echo "$FLAGS") >> "$FLAGDIR/$VMI-$1.txt"
+    echo "Extra guest vCPU flags not on host:" > "$FLAGDIR/$NAME-$1.txt"
+    comm -13 "$FLAGDIR/HOST.txt" <(echo "$FLAGS") >> "$FLAGDIR/$NAME-$1.txt"
+    echo -e '\nHost CPU flags missing in guest:' >> "$FLAGDIR/$NAME-$1.txt"
+    comm -23 "$FLAGDIR/HOST.txt" <(echo "$FLAGS") >> "$FLAGDIR/$NAME-$1.txt"
 }
 
 # separate out the footer and close I/O redirect
@@ -139,16 +144,17 @@ testfooter() {
 getip() {
     echo "* getip"
     local WAIT
-    let WAIT=EPOCHSECONDS+10
+    let WAIT=EPOCHSECONDS+20
     while true; do
         VMIP="$(virsh domifaddr "$NAME" | sed -nr 's,.* (\S+)/.*,\1,p')"
         if [[ -n "$VMIP" ]]; then
             break
         fi
         if [[ "$EPOCHSECONDS" -gt "$WAIT" ]]; then
-            echo >&2 "VM $NAME failed to get VM IP"
+            echo >&2 "VM $NAME get IP timed out"
             exit 1
         fi
+        echo "Waiting to get IP of VM $NAME - $((WAIT-EPOCHSECONDS))"
         sleep 1
     done
     echo "VMIP is $VMIP"
@@ -234,69 +240,65 @@ waitstop() {
     done
 }
 
+if [[ "$(</sys/devices/system/cpu/smt/control)" == "on" ]]; then # ht on
+
+    vmstart
+    sshrun "date '+%F %T %Z'" # quick check ssh connection
+    runtests hton-htunaware-nopin-idle
+    vmstop
+
+    vmstart 0 2 4 6
+    runtests hton-htunaware-pin-indep-idle
+    vmstop
+
+    vmstart 0 2 8 10
+    runtests hton-htunaware-pin-indep-numasplit-idle
+    vmstop
+
+    vmstart 1 17 2 18 ht
+    runtests hton-htaware-pin-sib-idle
+    vmstop
+
+    vmstart 1 2 17 18 ht
+    runtests hton-htaware-pin-mistopo-idle
+    vmstop
+
+    vmstart 0 2
+    runtests hton-htunaware-pin-2indep-idle
+    vmstop
+
+    vmstart 1 17 ht
+    runtests hton-htaware-pin-2sib-idle
+    vmstop
+
+else # ht off
+
+    vmstart
+    runtests htoff-htunware-nopin-idle
+    vmstop
+
+    vmstart 0 2 4 6
+    runtests htoff-htunaware-pin-indep-idle
+    vmstop
+
+    vmstart 0 2 8 10
+    runtests htoff-htunaware-pin-indep-numasplit-idle
+    vmstop
+
+    vmstart 0 2 4 6 ht
+    runtests htoff-htaware-pin-fakesib-idle
+    vmstop
+
+    vmstart 0 2
+    runtests htoff-htunaware-pin-2indep-idle
+    vmstop
+
     vmstart 0
     runtests htoff-htunaware-pin-1core-idle
     vmstop
 
-#if [[ "$(</sys/devices/system/cpu/smt/control)" == "on" ]]; then # ht on
-#
-#    vmstart
-#    sshrun "date '+%F %T %Z'" # quick check ssh connection
-#    runtests hton-htunaware-nopin-idle
-#    vmstop
-#
-#    vmstart 0 2 4 6
-#    runtests hton-htunaware-pin-indep-idle
-#    vmstop
-#
-#    vmstart 0 2 8 10
-#    runtests hton-htunaware-pin-indep-numasplit-idle
-#    vmstop
-#
-#    vmstart 1 17 2 18 ht
-#    runtests hton-htaware-pin-sib-idle
-#    vmstop
-#
-#    vmstart 1 2 17 18 ht
-#    runtests hton-htaware-pin-mistopo-idle
-#    vmstop
-#
-#    vmstart 0 2
-#    runtests hton-htunaware-pin-2indep-idle
-#    vmstop
-#
-#    vmstart 1 17 ht
-#    runtests hton-htaware-pin-2sib-idle
-#    vmstop
-#
-#else # ht off
-#
-#    vmstart
-#    runtests htoff-htunware-nopin-idle
-#    vmstop
-#
-#    vmstart 0 2 4 6
-#    runtests htoff-htunaware-pin-indep-idle
-#    vmstop
-#
-#    vmstart 0 2 8 10
-#    runtests htoff-htunaware-pin-indep-numasplit-idle
-#    vmstop
-#
-#    vmstart 0 2 4 6 ht
-#    runtests htoff-htaware-pin-fakesib-idle
-#    vmstop
-#
-#    vmstart 0 2
-#    runtests htoff-htunaware-pin-2indep-idle
-#    vmstop
-#
-#    vmstart 0
-#    runtests htoff-htunaware-pin-1core-idle
-#    vmstop
-#
-#fi
-#
+fi
+
 #============== Final tidy up ===============================================
 
 echo; echo "Tests completed for ht=$(</sys/devices/system/cpu/smt/control)"
