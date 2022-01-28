@@ -4,6 +4,7 @@ RESDIR="/root/results/kube"          # path to directory for test results
 XMLDIR="/root/testcfg/kubexml"       # path to directory for test XML
 YAMLDIR="/root/testcfg/kubeyaml"     # path to directory for test YAML
 FLAGDIR="/root/testcfg/kubeflag"     # path to directory for guest vCPU flags
+JSONDIR="/root/results/kubejson"     # path to directory for kubevirt json data   
 BASEYAML="/root/yaml/kube-vmi.yaml"  # path to base YAML file
 WORKER="rocks02"                     # hostname of worker node
 
@@ -34,6 +35,7 @@ mkdir -p "$RESDIR"
 mkdir -p "$XMLDIR"
 mkdir -p "$YAMLDIR"
 mkdir -p "$FLAGDIR"
+mkdir -p "$JSONDIR"
 
 exec 3>&1   # save stdout to spare file handle 3
 exec 4>&2   # save stderr to spare file handle 4
@@ -49,14 +51,16 @@ runtests() {
     testheader "$1"
 
     echo; echo "---------- cyclictest ----------"
-    for i in {1..20}; do
-        sshrun cyclictest -t 2 -q -l 100000
-    done
-
+    sshrun cyclictest -t 2 -v -l 100000 | sed '/^\S/d' | sort -sn | \
+        sed -nr ':a;s/^ +0: +\S+ +//;tb;bc;
+                :b;1s/^/{"T0":[/;s/$/,/;H;n;ba;
+                        :c;x;s/,$/],/;s/\n//g;p;s/.*/"T1":[/;x;
+                                :d;s/^ +1: +\S+ +//;s/$/,/;H;$!{n;bd};x;s/,$/]}/;s/\n//g;p' \
+                                        > "$JSONDIR/$VMI-$1.json"
     echo; echo "-------------- NPB --------------"
     for NPB in bt.C.x cg.C.x ep.C.x ft.C.x is.C.x lu.C.x mg.C.x sp.C.x ua.C.x; do
         echo; echo "--- NPB class $NPB start ---"
-        sshrun "$NPB"
+        sshrun "OMP_NUM_THREADS=2 $NPB"
         echo; echo "--- NPB class $NPB end ---"
     done
 
