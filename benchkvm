@@ -1,18 +1,19 @@
 #!/bin/bash -e
 
-NAME="opensuse-4"                  # name of the VM to use for testing
+REPEAT=5                           # number of times to repeat all the tests
+NAME="kvm"                         # name of the VM to use for testing
+CONTFILE="/root/benchkvm-continue" # continue file tracks loops across reboots
+OUTDIR="/root/results/output"      # dir for script output
 RESDIR="/root/results/kvm"         # path to directory for test results
-XMLDIR="/root/testcfg/kvmxml"      # path to directory for test XML
-JSONDIR="/root/results/kvmjson"    # dir for cyclictest json data
-FLAGDIR="/root/testcfg/kvmflag"    # path to directory for guest vCPU flags
+# JSONDIR="/root/results/kvm/json"   # dir for cyclictest json data
+XMLDIR="/root/testcfg/kvm/xml"     # path to directory for test XML
+FLAGDIR="/root/testcfg/kvm/flags"  # path to directory for guest vCPU flags
+
 XML=                               # holds current test XML
 VMIP=                              # the current VM's IP address
 STRESSER=                          # process ID of the host load stresser
 
 #============== initial checks =============================================
-
-# make sure we don't loop
-test -f /root/benchkvm-continue && rm /root/benchkvm-continue
 
 # check that the named VM exists
 if ! virsh list --all | grep -qE "^ *\S+ +$NAME "; then
@@ -32,46 +33,32 @@ if virsh list | grep -q 'running$'; then
     exit 1
 fi
 
-# ensure that the results and XML output dirs exist
-mkdir -p "$RESDIR"
-mkdir -p "$XMLDIR"
-mkdir -p "$JSONDIR"
-mkdir -p "$FLAGDIR"
-
-exec 3>&1   # save stdout to spare file handle 3
-exec 4>&2   # save stderr to spare file handle 4
-
-lscpu | sed -nr '/^Flags: /{s/^Flags: *//;s/ +/\n/g;p}' | sort > "$FLAGDIR/HOST.txt"
-
-# set CPU freq scaling governor to use the "performance" profile
-trap 'cpupower frequency-set -g powersave' EXIT
-cpupower frequency-set -g performance >/dev/null
-cpupower frequency-info -p
-
 #============== functions ==================================================
 
 # all the tests to run via ssh
 # arg is the cpu topology name (used as a filename suffix)
 runtests() {
-    echo "* runtests $*"
+    echo "* start runtests $*"
     testheader "$1"
 
     echo; echo "---------- cyclictest ----------"
-    sshrun cyclictest -t 2 -v -l 100000 | sed '/^\S/d' | sort -sn | \
-    sed -nr ':a;s/^ +0: +\S+ +//;tb;bc;
-        :b;1s/^/{"T0":[/;s/$/,/;H;n;ba;
-        :c;x;s/,$/],/;s/\n//g;p;s/.*/"T1":[/;x;
-        :d;s/^ +1: +\S+ +//;s/$/,/;H;$!{n;bd};x;s/,$/]}/;s/\n//g;p' \
-        > "$JSONDIR/$NAME-$1.json"
+    sshrun cyclictest -t 2 -v -l 100000
 
     echo; echo "-------------- NPB --------------"
     for NPB in bt.C.x cg.C.x ep.C.x ft.C.x is.C.x lu.C.x mg.C.x sp.C.x ua.C.x; do
+        echo; echo "Time now: $(date '+%F %T %Z')"
         echo; echo "--- NPB class $NPB start ---"
-        sshrun "OMP_NUM_THREADS=2 $NPB"
+        if [[ -z "$2" ]]; then
+            OMP_THREADS=2
+        else
+            OMP_THREADS="$2"
+        fi
+        sshrun "OMP_NUM_THREADS=$OMP_THREADS $NPB"
         echo; echo "--- NPB class $NPB end ---"
     done
 
     testfooter
+    echo "* end runtests $*"
 }
 
 # run or stop load stresser in the background
@@ -102,11 +89,6 @@ stress() {
     fi
 }
 
-# factor out the tedious repetition of ssh root@"$VMIP"
-sshrun() {
-    ssh root@"$VMIP" "$@"
-}
-
 # separate out the rather complex header code, and I/O redirection
 # arg is the logfile suffix
 testheader() {
@@ -118,7 +100,9 @@ testheader() {
     echo -n "Hyperthreading is $(</sys/devices/system/cpu/smt/control), with "
     if virsh vcpuinfo "$NAME" | grep -q '^CPU Affinity: *-'; then
         echo "this vCPU pinning:"
-        virsh vcpuinfo "$NAME" | sed '/State\|time/d;/./{H;d};x;s/CPU //;s/  \+/ /g;s/^\n//;s/\n/, /g'
+        virsh vcpuinfo "$NAME" \
+        | sed -r '/State|time/d;/./{H;d};x;s/CPU //;s/  +/ /g;
+        s/^\n//;s/\n/, /g;s/( CPU: )([0-9])\>/\1 \2/g'
     else
         echo "no pinning."
     fi
@@ -140,11 +124,16 @@ testfooter() {
     exec >&3 2>&4 # end the I/O redirection
 }
 
+# factor out the tedious repetition of ssh root@"$VMIP"
+sshrun() {
+    ssh root@"$VMIP" "$@"
+}
+
 # read the IP of the VM
 getip() {
     echo "* getip"
     local WAIT
-    let WAIT=EPOCHSECONDS+20
+    let WAIT=EPOCHSECONDS+40
     while true; do
         VMIP="$(virsh domifaddr "$NAME" | sed -nr 's,.* (\S+)/.*,\1,p')"
         if [[ -n "$VMIP" ]]; then
@@ -185,7 +174,7 @@ vmstart() {
         CORES="$(virsh vcpucount "$NAME" | sed -n 's/^maximum *config *//p')"
     fi
     XML="$(virt-xml "$NAME" --edit --vcpus=vcpu="$CORES" --print-xml)"
-    let CORES/=TH
+    CORES="$((CORES/TH))"
     XML="$(virt-xml <<<"$XML" --edit --cpu=clearxml=yes,mode=host-passthrough,topology.sockets=1,topology.cores="$CORES",topology.threads="$TH" --print-xml)"
     XML="$(virt-xml <<<"$XML" --edit --cputune=clearxml=yes"$PIN" --print-xml)"
     echo "Starting VM $NAME with cores=$CORES threads=$TH"
@@ -212,6 +201,7 @@ waitssh() {
             echo >&2 "VM $NAME failed to boot"
             exit 1
         fi
+        echo "Waiting for ssh on VM $NAME IP $VMIP - $((WAIT-EPOCHSECONDS))"
         sleep 2
     done
 }
@@ -236,80 +226,166 @@ waitstop() {
             echo >&2 "VM $NAME failed to shut down"
             exit 1
         fi
+        echo "Waiting for VM $NAME to shutdown - $((WAIT-EPOCHSECONDS))"
         sleep 2
     done
 }
 
-if [[ "$(</sys/devices/system/cpu/smt/control)" == "on" ]]; then # ht on
-
-    vmstart
-    sshrun "date '+%F %T %Z'" # quick check ssh connection
-    runtests hton-htunaware-nopin-idle
-    vmstop
-
-    vmstart 0 2 4 6
-    runtests hton-htunaware-pin-indep-idle
-    vmstop
-
-    vmstart 0 2 8 10
-    runtests hton-htunaware-pin-indep-numasplit-idle
-    vmstop
-
-    vmstart 1 17 2 18 ht
-    runtests hton-htaware-pin-sib-idle
-    vmstop
-
-    vmstart 1 2 17 18 ht
-    runtests hton-htaware-pin-mistopo-idle
-    vmstop
-
-    vmstart 0 2
-    runtests hton-htunaware-pin-2indep-idle
-    vmstop
-
-    vmstart 1 17 ht
-    runtests hton-htaware-pin-2sib-idle
-    vmstop
-
-else # ht off
-
-    vmstart
-    runtests htoff-htunware-nopin-idle
-    vmstop
-
-    vmstart 0 2 4 6
-    runtests htoff-htunaware-pin-indep-idle
-    vmstop
-
-    vmstart 0 2 8 10
-    runtests htoff-htunaware-pin-indep-numasplit-idle
-    vmstop
-
-    vmstart 0 2 4 6 ht
-    runtests htoff-htaware-pin-fakesib-idle
-    vmstop
-
-    vmstart 0 2
-    runtests htoff-htunaware-pin-2indep-idle
-    vmstop
-
-    vmstart 0
-    runtests htoff-htunaware-pin-1core-idle
-    vmstop
-
-fi
-
-#============== Final tidy up ===============================================
-
-echo; echo "Tests completed for ht=$(</sys/devices/system/cpu/smt/control)"
-cpupower frequency-set -g powersave >/dev/null
-cpupower frequency-info -p
-trap EXIT
-
-if [[ "$1" == "reboot" ]]; then
-    if [[ "$(</sys/devices/system/cpu/smt/control)" == "on" ]]; then
-        touch /root/benchkvm-continue
-        grub-reboot nosmt
+# decrement the counter in CONTFILE
+# and exit when the counter reaches zero
+countdown() {
+    echo "* countdown"
+    local CONT
+    # create the CONTFILE if it does not exist
+    if [[ ! -f "$CONTFILE" ]]; then
+        echo "Creating CONTFILE $CONTFILE with REPEAT=$REPEAT"
+        # make sure the dir exists if the filename has a slash
+        if [[ "$CONTFILE" =~ / ]]; then
+            mkdir -p "${CONTFILE%/*}"
+        fi
+        # start with REPEAT loops to do
+        echo "$REPEAT" > "$CONTFILE"
+    else
+        # if it exits, read the counter from CONTFILE
+        CONT="$(<"$CONTFILE")"
+        echo -n "Decrementing CONT from $CONT to "
+        # and decrement it by one
+        CONT="$((CONT-1))"
+        # WARNING do not write let CONT-=1 or ((CONT-=1))
+        # because they have a false exit code which causes
+        # bash to trigger the "errexit" feature
+        echo "$CONT"
+        # if there are still more loops to do
+        if [[ "$CONT" -gt 0 ]]; then
+            echo "Updating CONTFILE with CONT=$CONT"
+            # then update the CONTFILE
+            echo "$CONT" > "$CONTFILE"
+        else
+            echo "Removing CONTFILE"
+            # no more loops, so remove the CONTFILE and exit
+            rm "$CONTFILE"
+        fi
     fi
-    reboot
+}
+
+#============== main code ==================================================
+
+# ensure that the results and XML output dirs exist
+mkdir -p "$OUTDIR"
+mkdir -p "$RESDIR"
+mkdir -p "$XMLDIR"
+mkdir -p "$FLAGDIR"
+# mkdir -p "$JSONDIR"
+
+if [[ ! -f "$CONTFILE" ]]; then
+    countdown
 fi
+
+{
+
+    exec 3>&1   # save stdout to spare file handle 3
+    exec 4>&2   # save stderr to spare file handle 4
+
+    lscpu | sed -nr '/^Flags: /{s/^Flags: *//;s/ +/\n/g;p}' \
+    | sort > "$FLAGDIR/HOST.txt"
+
+    # set CPU freq scaling governor to use the "performance" profile
+    trap 'cpupower frequency-set -g powersave' EXIT
+    cpupower frequency-set -g performance >/dev/null
+    cpupower frequency-info -p
+
+    if [[ "$(</sys/devices/system/cpu/smt/control)" == "on" ]]; then # ht on
+
+        vmstart
+        sshrun "date '+%F %T %Z'" # quick check ssh connection
+        runtests hton-htunaware-nopin-4x1-idle
+        vmstop
+
+        vmstart 0 2 4 6
+        runtests hton-htunaware-pin-4x1-idle
+        vmstop
+
+        vmstart 0 2 8 10
+        runtests hton-htunaware-pin-4x1-numasplit-idle
+        vmstop
+
+        vmstart 1 17 2 18
+        runtests hton-htunaware-pin-2x2-fakeindep-idle
+        vmstop
+
+        vmstart 1 17 2 18 ht
+        runtests hton-htaware-pin-2x2-idle
+        vmstop
+
+        vmstart 1 2 17 18 ht
+        runtests hton-htaware-pin-2x2-mistopo-idle
+        vmstop
+
+        vmstart 1 17 2 18 ht
+        runtests hton-htaware-pin-2x2-npb4-idle 4
+        vmstop
+
+        vmstart 0 2
+        runtests hton-htunaware-pin-2x1-idle
+        vmstop
+
+        vmstart 1 17 ht
+        runtests hton-htaware-pin-1x2-idle
+        vmstop
+
+    else # ht off
+
+        vmstart
+        runtests htoff-htunaware-nopin-4x1-idle
+        vmstop
+
+        vmstart 0 2 4 6
+        runtests htoff-htunaware-pin-4x1-idle
+        vmstop
+
+        vmstart 0 2 8 10
+        runtests htoff-htunaware-pin-4x1-numasplit-idle
+        vmstop
+
+        vmstart 0 2 4 6 ht
+        runtests htoff-htaware-pin-4x1-fakesib-idle
+        vmstop
+
+        vmstart 0 2
+        runtests htoff-htunaware-pin-2x1-idle
+        vmstop
+
+        vmstart 0 2 4 6 ht
+        runtests htoff-htaware-pin-2x2-fakesib-npb4-idle 4
+        vmstop
+
+        vmstart 0
+        runtests htoff-htunaware-pin-1x1-idle
+        vmstop
+
+    fi
+
+    #============== Final tidy up ===============================================
+
+    echo; echo "Tests completed for ht=$(</sys/devices/system/cpu/smt/control)"
+    cpupower frequency-set -g powersave >/dev/null
+    cpupower frequency-info -p
+    trap EXIT
+
+    if [[ "$1" == "reboot" ]]; then
+        if [[ "$(</sys/devices/system/cpu/smt/control)" == "on" ]]; then
+            echo "Rebooting into nosmt mode"
+            grub-reboot nosmt
+        else
+            echo "Rebooting back into normal smt mode"
+            countdown
+        fi
+        sync
+        reboot
+    else
+        countdown
+        # run this same script again without nesting shells
+        test -f "$CONTFILE" && exec "$0"
+    fi
+
+} |& tee -a "$OUTDIR/kvm.txt"
