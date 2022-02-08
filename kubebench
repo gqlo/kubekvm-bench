@@ -1,12 +1,13 @@
 #!/bin/bash -e
 
-RESDIR="/root/results/kube"          # path to directory for test results
-XMLDIR="/root/testcfg/kubexml"       # path to directory for test XML
-YAMLDIR="/root/testcfg/kubeyaml"     # path to directory for test YAML
-FLAGDIR="/root/testcfg/kubeflag"     # path to directory for guest vCPU flags
-JSONDIR="/root/results/kubejson"     # path to directory for kubevirt json data   
-BASEYAML="/root/yaml/kube-vmi.yaml"  # path to base YAML file
+REPEAT=5                             # number of times to repeat all the tests
 WORKER="rocks02"                     # hostname of worker node
+OUTDIR="/root/results/output"        # dir for script output
+RESDIR="/root/results/kube"          # path to directory for test results
+XMLDIR="/root/testcfg/kube/xml"      # path to directory for test XML
+YAMLDIR="/root/testcfg/kube/yaml"    # path to directory for test YAML
+FLAGDIR="/root/testcfg/kube/flags"   # path to directory for guest vCPU flags
+BASEYAML="/root/yaml/kube.yaml"      # path to base YAML file
 
 POD=                                 # name of launcher pod
 VMI=                                 # name of the vm instance
@@ -30,18 +31,6 @@ if kubectl get pods --all-namespaces | grep -qE '^\S+ *virt-launcher-'; then
     exit 1
 fi
 
-# ensure that the results and XML output dirs exist
-mkdir -p "$RESDIR"
-mkdir -p "$XMLDIR"
-mkdir -p "$YAMLDIR"
-mkdir -p "$FLAGDIR"
-mkdir -p "$JSONDIR"
-
-exec 3>&1   # save stdout to spare file handle 3
-exec 4>&2   # save stderr to spare file handle 4
-
-lscpu | sed -nr '/^Flags: /{s/^Flags: *//;s/ +/\n/g;p}' | sort > "$FLAGDIR/HOST.txt"
-
 #============== functions ==================================================
 
 # all the tests to run via ssh
@@ -51,16 +40,18 @@ runtests() {
     testheader "$1"
 
     echo; echo "---------- cyclictest ----------"
-    sshrun cyclictest -t 2 -v -l 100000 | sed '/^\S/d' | sort -sn | \
-        sed -nr ':a;s/^ +0: +\S+ +//;tb;bc;
-                :b;1s/^/{"T0":[/;s/$/,/;H;n;ba;
-                        :c;x;s/,$/],/;s/\n//g;p;s/.*/"T1":[/;x;
-                                :d;s/^ +1: +\S+ +//;s/$/,/;H;$!{n;bd};x;s/,$/]}/;s/\n//g;p' \
-                                        > "$JSONDIR/$VMI-$1.json"
+    sshrun cyclictest -t 2 -v -l 100000
+
     echo; echo "-------------- NPB --------------"
     for NPB in bt.C.x cg.C.x ep.C.x ft.C.x is.C.x lu.C.x mg.C.x sp.C.x ua.C.x; do
+        echo; echo "Time now: $(date '+%F %T %Z')"
         echo; echo "--- NPB class $NPB start ---"
-        sshrun "OMP_NUM_THREADS=2 $NPB"
+        if [[ -z "$2" ]]; then
+            OMP_THREADS=2
+        else
+            OMP_THREADS="$2"
+        fi
+        sshrun "OMP_NUM_THREADS=$OMP_THREADS $NPB"
         echo; echo "--- NPB class $NPB end ---"
     done
 
@@ -95,19 +86,6 @@ stress() {
     fi
 }
 
-workerrun() {
-    ssh root@"$WORKER" "$@"
-}
-
-# factor out the tedious repetition of ssh root@"$VMIP"
-sshrun() {
-    ssh -o CheckHostIP=no root@"$VMIP" "$@"
-}
-
-kvrun() {
-    kubectl exec "$POD" -- "$@"
-}
-
 # separate out the rather complex header code, and I/O redirection
 # arg is the logfile suffix
 testheader() {
@@ -120,7 +98,9 @@ testheader() {
     echo -n "Hyperthreading is $(workerrun cat /sys/devices/system/cpu/smt/control), with "
     if kvrun virsh vcpuinfo "$IVM" | grep -q '^CPU Affinity: *-'; then
         echo "this vCPU pinning:"
-        kvrun virsh vcpuinfo "$IVM" | sed '/State\|time/d;/./{H;d};x;s/CPU //;s/  \+/ /g;s/^\n//;s/\n/, /g'
+        kvrun virsh vcpuinfo "$IVM" \
+        | sed -r '/State|time/d;/./{H;d};x;s/CPU //;s/  +/ /g;
+        s/^\n//;s/\n/, /g;s/( CPU: )([0-9])\>/\1 \2/g'
     else
         echo "no pinning."
     fi
@@ -142,11 +122,24 @@ testfooter() {
     exec >&3 2>&4 # end the I/O redirection
 }
 
+workerrun() {
+    ssh root@"$WORKER" "$@"
+}
+
+# factor out the tedious repetition of ssh root@"$VMIP"
+sshrun() {
+    ssh -o CheckHostIP=no root@"$VMIP" "$@"
+}
+
+kvrun() {
+    kubectl exec "$POD" -- "$@"
+}
+
 # read the IP of the VM
 getip() {
     echo "* getip"
     local WAIT
-    let WAIT=EPOCHSECONDS+25
+    let WAIT=EPOCHSECONDS+40
     while true; do
         VMIP="$(kubectl get vmi | sed -nr "s/^$VMI"' *\S+ *Running *(\S+) *\S+ *True$/\1/p')"
         if [[ -n "$VMIP" ]]; then
@@ -156,6 +149,7 @@ getip() {
             echo >&2 "Failed to get IP of VMI $VMI"
             exit 1
         fi
+        echo "Waiting to get IP of VMI $VMI - $((WAIT-EPOCHSECONDS))"
         sleep 1
     done
     echo "VMIP is $VMIP"
@@ -198,6 +192,7 @@ waitssh() {
             echo >&2 "VMI $VMI failed to boot"
             exit 1
         fi
+        echo "Waiting for ssh on VMI $VMI IP $VMIP - $((WAIT-EPOCHSECONDS))"
         sleep 2
     done
 }
@@ -223,6 +218,7 @@ waitstop() {
             echo >&2 "VMI $VMI failed to shut down"
             exit 1
         fi
+        echo "Waiting for VMI $VMI to shutdown - $((WAIT-EPOCHSECONDS))"
         sleep 2
     done
 }
@@ -231,8 +227,7 @@ waitworkerup() {
     let WAIT=EPOCHSECONDS+"$1"
     while true; do
         # test if port 22 is open
-        if nc -nzw2 "$(getent ahostsv4 "$WORKER" \
-            | sed -nr 's/^(\S+) *STREAM.*/\1/p')" 22; then
+        if nc -nzw2 "$(getent ahostsv4 "$WORKER" | sed -nr 's/^(\S+) *STREAM.*/\1/p')" 22; then
             echo "Worker node $WORKER up"
             if kubectl wait --for=condition=Ready nodes \
                 --timeout="$2"s --all --all-namespaces \
@@ -272,14 +267,36 @@ waitworkerdown() {
 
 #============== main code ==================================================
 
-while true; do
+# ensure that the results and XML output dirs exist
+mkdir -p "$OUTDIR"
+mkdir -p "$RESDIR"
+mkdir -p "$XMLDIR"
+mkdir -p "$YAMLDIR"
+mkdir -p "$FLAGDIR"
+# mkdir -p "$JSONDIR"
+
+{
+
+exec 3>&1   # save stdout to spare file handle 3
+exec 4>&2   # save stderr to spare file handle 4
+
+while [[ "$REPEAT" -gt 0 ]]; do
+
+    workerrun lscpu \
+    | sed -nr '/^Flags: /{s/^Flags: *//;s/ +/\n/g;p}' \
+    | sort > "$FLAGDIR/HOST.txt"
 
     # set CPU freq scaling governor to use the "performance" profile
     trap 'workerrun cpupower frequency-set -g powersave' EXIT
     workerrun cpupower frequency-set -g performance >/dev/null
     workerrun cpupower frequency-info -p
 
-    if [[ "$(workerrun cat /sys/devices/system/cpu/smt/control)" == "on" ]]; then # ht on
+    if [[ "$(workerrun cat /sys/devices/system/cpu/smt/control)" == "on" ]]; then
+        # ht on
+
+        kvstart 2 1
+        sshrun hostname
+        kvstop
 
         kvstart 4 1
         sshrun "date '+%F %T %Z'" # quick check ssh connection
@@ -296,6 +313,10 @@ while true; do
 
         kvstart 2 2 pin
         runtests hton-htaware-pin-2x2-idle
+        kvstop
+
+        kvstart 2 2 pin
+        runtests hton-htaware-pin-2x2-npb4-idle 4
         kvstop
 
         kvstart 2 1 pin
@@ -317,11 +338,19 @@ while true; do
     else : # ht off
 
         kvstart 4 1
-        runtests htoff-htunware-nopin-4x1-idle
+        runtests htoff-htunaware-nopin-4x1-idle
         kvstop
 
         kvstart 4 1 pin
         runtests htoff-htunaware-pin-4x1-idle
+        kvstop
+
+        kvstart 2 2 pin
+        runtests htoff-htaware-pin-2x2-fakesib-idle
+        kvstop
+
+        kvstart 2 2 pin
+        runtests htoff-htaware-pin-2x2-fakesib-npb4-idle 4
         kvstop
 
         kvstart 2 1 pin
@@ -361,11 +390,14 @@ while true; do
             workerrun reboot || true
             waitworkerdown 20
             waitworkerup 240 60      # boot timeout, kubelet timeout
-            break
+            REPEAT="$((REPEAT-1))"
         fi
     else
         echo "Single pass done"
-        break
+        REPEAT="$((REPEAT-1))"
     fi
 
 done
+
+} |& tee -a "$OUTDIR/kube.txt"
+echo "Done"
