@@ -1,4 +1,5 @@
 #!/bin/bash -e
+# Many thanks to my old friend James for all the guidance and tips on writing this script
 
 REPEAT=5                           # number of times to repeat all the tests
 NAME="kvm"                         # name of the VM to use for testing
