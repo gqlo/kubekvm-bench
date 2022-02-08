@@ -6,7 +6,6 @@ NAME="kvm"                         # name of the VM to use for testing
 CONTFILE="/root/benchkvm-continue" # continue file tracks loops across reboots
 OUTDIR="/root/results/output"      # dir for script output
 RESDIR="/root/results/kvm"         # path to directory for test results
-# JSONDIR="/root/results/kvm/json"   # dir for cyclictest json data
 XMLDIR="/root/testcfg/kvm/xml"     # path to directory for test XML
 FLAGDIR="/root/testcfg/kvm/flags"  # path to directory for guest vCPU flags
 
